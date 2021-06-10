@@ -325,6 +325,7 @@ class LambdaExecutorContainers(LambdaExecutor):
 
         # determine the command to be executed (implemented by subclasses)
         cmd = self.prepare_execution(func_details, environment, command)
+        cmd = cmd % event_body
 
         # copy events file into container, if necessary
         if events_file_path:
@@ -389,16 +390,51 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
             copy_command = '%s cp "%s/." "%s:%s";' % (docker_cmd,
                 lambda_cwd, container_info.name, DOCKER_TASK_FOLDER)
 
+        hostname = self.get_docker_container_hostname(func_details.arn())
+        output_filename = ' _lambda.events.%s.json' % short_uid()
         cmd = (
-            '%s'
-            ' %s exec'
-            ' %s'  # env variables file
-            ' %s'  # container name
-            ' %s'  # run cmd
-        ) % (copy_command, docker_cmd, env_vars_flag, container_info.name, command)
+            'aws lambda invoke'
+            ' --endpoint http://%s:9001'
+            ' --no-sign-request'
+            ' --function-name %s'
+            ' --payload \'%%s\''
+            ' %s'
+            ' --region eu-west-1'
+            '; cat %s'
+        ) % (hostname, func_details.arn(), output_filename, output_filename)
         LOG.debug('Command for docker-reuse Lambda executor: %s' % cmd)
 
         return cmd
+
+    def get_docker_container_hostname(self, func_arn):
+        """
+        Determine the hostname of a docker container.
+        :param func_arn: The ARN of the lambda function.
+        :return: hostname that can be interacted with
+        """
+        with self.docker_container_lock:
+            status = self.get_docker_container_status(func_arn)
+            # container does not exist
+            if status == 0:
+                return ''
+
+            # Get the container name.
+            container_name = self.get_container_name(func_arn)
+            docker_cmd = self._docker_cmd()
+
+            # Get the container network
+            LOG.debug('Getting container hostname: %s' % container_name)
+            cmd = (
+                '%s inspect %s'
+                ' --format "{{ .Config.Hostname }}"'
+            ) % (docker_cmd, container_name)
+
+            LOG.debug(cmd)
+            cmd_result = run(cmd, asynchronous=False, stderr=subprocess.PIPE, outfile=subprocess.PIPE)
+
+            container_hostname = cmd_result.strip()
+
+            return container_hostname
 
     def _execute(self, func_arn, *args, **kwargs):
         if not LAMBDA_CONCURRENCY_LOCK.get(func_arn):
@@ -498,9 +534,10 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
             '%s create'
             ' %s'  # --rm flag
             ' --name "%s"'
-            ' --entrypoint /bin/bash'  # Load bash when it starts.
             ' %s'
             ' --interactive'  # Keeps the container running bash.
+            ' --expose 9001'
+            ' -e DOCKER_LAMBDA_STAY_OPEN=1'
             ' -e AWS_LAMBDA_EVENT_BODY="$AWS_LAMBDA_EVENT_BODY"'
             ' -e HOSTNAME="$HOSTNAME"'
             ' -e LOCALSTACK_HOSTNAME="$LOCALSTACK_HOSTNAME"'
@@ -541,25 +578,7 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
         :param func_arn: The ARN of the lambda function.
         :return: None
         """
-        with self.docker_container_lock:
-            status = self.get_docker_container_status(func_arn)
-            docker_cmd = self._docker_cmd()
-
-            # Get the container name and id.
-            container_name = self.get_container_name(func_arn)
-
-            if status == 1:
-                LOG.debug('Stopping container: %s' % container_name)
-                cmd = '%s stop -t0 %s' % (docker_cmd, container_name)
-
-                LOG.debug(cmd)
-                run(cmd, asynchronous=False, stderr=subprocess.PIPE, outfile=subprocess.PIPE)
-
-                status = self.get_docker_container_status(func_arn)
-
-            if status == -1:
-                LOG.debug('Removing container: %s' % container_name)
-                rm_docker_container(container_name, safe=True)
+        pass # TODO: only if finished!
 
     def get_all_container_names(self):
         """
@@ -741,6 +760,8 @@ class LambdaExecutorSeparateContainers(LambdaExecutorContainers):
                 docker_cmd, lambda_cwd, DOCKER_TASK_FOLDER)) if lambda_cwd else ''
             cmd = (
                 'CONTAINER_ID="$(%s create -i'
+            ' --expose 9001'
+            ' -e DOCKER_LAMBDA_STAY_OPEN=1'
                 ' %s'  # entrypoint
                 ' %s'  # debug_docker_java_port
                 ' %s'  # common flags
