@@ -319,7 +319,7 @@ class LambdaExecutorContainers(LambdaExecutor):
 
         # determine the command to be executed (implemented by subclasses)
         cmd = self.prepare_execution(func_details, environment, command)
-        cmd = cmd % stdin
+        cmd = cmd % event_body
 
         # run Lambda executor and fetch invocation result
         LOG.info('Running lambda cmd: %s' % cmd)
